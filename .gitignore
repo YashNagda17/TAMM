@@ -5,6 +5,7 @@ TAMM.includes
 TAMM.creator
 TAMM.creator.user
 *.autosave
+install/
 
 #These are configuration files for CLion
 .idea/

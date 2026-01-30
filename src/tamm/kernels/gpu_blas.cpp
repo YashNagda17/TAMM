@@ -10,8 +10,6 @@
 #if defined(USE_CUDA)
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #elif defined(USE_HIP)
 #include <rocblas/rocblas.h>
 #include <hip/hip_runtime.h>
@@ -27,55 +25,20 @@
 // =============================================================================
 namespace tamm::kernels::gpu {
 
-enum class GemmDType {
-  FP64,   // double precision (default)
-  FP32,   // single precision
-  FP16,   // half precision
-  BF16,   // bfloat16
-  TF32    // TensorFloat-32 (uses FP32 storage with TF32 compute)
-};
-
 class GemmProfiler {
 private:
   std::ofstream csv_file_;
   std::mutex    mutex_;
   bool          enabled_ = false;
   bool          initialized_ = false;
-  GemmDType     dtype_ = GemmDType::FP64;
-  std::string   dtype_str_ = "fp64";
 
   GemmProfiler() {
     // Check if profiling is enabled via environment variable
     const char* profile_env = std::getenv("TAMM_GEMM_PROFILE");
-    if(profile_env && std::string(profile_env) == "1") {
-      enabled_ = true;
-    }
-
-    // Get dtype from environment variable
-    const char* dtype_env = std::getenv("TAMM_GEMM_DTYPE");
-    if(dtype_env) {
-      std::string dtype_val(dtype_env);
-      if(dtype_val == "fp64" || dtype_val == "FP64") {
-        dtype_ = GemmDType::FP64;
-        dtype_str_ = "fp64";
-      }
-      else if(dtype_val == "fp32" || dtype_val == "FP32") {
-        dtype_ = GemmDType::FP32;
-        dtype_str_ = "fp32";
-      }
-      else if(dtype_val == "fp16" || dtype_val == "FP16") {
-        dtype_ = GemmDType::FP16;
-        dtype_str_ = "fp16";
-      }
-      else if(dtype_val == "bf16" || dtype_val == "BF16") {
-        dtype_ = GemmDType::BF16;
-        dtype_str_ = "bf16";
-      }
-      else if(dtype_val == "tf32" || dtype_val == "TF32") {
-        dtype_ = GemmDType::TF32;
-        dtype_str_ = "tf32";
-      }
-    }
+    enabled_ = true;
+    // if(profile_env && std::string(profile_env) == "0") {
+    //   enabled_ = false;
+    // }
 
     // Get CSV output path
     const char* csv_path = std::getenv("TAMM_GEMM_CSV");
@@ -84,7 +47,7 @@ private:
     if(enabled_) {
       csv_file_.open(csv_filename, std::ios::out | std::ios::trunc);
       if(csv_file_.is_open()) {
-        csv_file_ << "m,n,k,dtype,time_us,gflops\n";
+        csv_file_ << "m,n,k,time_us\n";
         csv_file_.flush();
         initialized_ = true;
       }
@@ -99,19 +62,11 @@ public:
 
   bool is_enabled() const { return enabled_ && initialized_; }
 
-  GemmDType get_dtype() const { return dtype_; }
-  const std::string& get_dtype_str() const { return dtype_str_; }
-
   void log(int m, int n, int k, double time_us) {
     if(!is_enabled()) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
-
-    // Calculate GFLOPS: 2*m*n*k operations for GEMM
-    double gflops = (2.0 * m * n * k) / (time_us * 1000.0);  // time_us to seconds, ops to GFLOPS
-
-    csv_file_ << m << "," << n << "," << k << ","
-              << dtype_str_ << "," << time_us << "," << gflops << "\n";
+    csv_file_ << m << "," << n << "," << k << "," << time_us << "\n";
     csv_file_.flush();
   }
 
@@ -174,7 +129,6 @@ void tamm::kernels::gpu::gemm(int n, int m, int k, const T alpha, const T3* B, i
 
 #elif defined(USE_CUDA)
   auto& profiler = GemmProfiler::instance();
-  GemmDType dtype = profiler.get_dtype();
 
   // Synchronize before timing if profiling enabled
   if(profiler.is_enabled()) {
@@ -185,84 +139,14 @@ void tamm::kernels::gpu::gemm(int n, int m, int k, const T alpha, const T3* B, i
 
   if constexpr(tamm::internal::is_complex_v<T1> && tamm::internal::is_complex_v<T2> &&
                tamm::internal::is_complex_v<T3>) {
-    // Complex types - always use ZGEMM (FP64 complex)
     CUBLAS_CHECK(cublasZgemm(handle.second, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
                              (cuDoubleComplex*) &alpha, (cuDoubleComplex*) B, ldb,
                              (cuDoubleComplex*) A, lda, (cuDoubleComplex*) &beta,
                              (cuDoubleComplex*) C, ldc));
   }
   else {
-    // Real types - switch based on TAMM_GEMM_DTYPE environment variable
-    switch(dtype) {
-      case GemmDType::TF32: {
-        // TF32: Use cublasGemmEx with TF32 compute type (requires Ampere+)
-        // Input/output remain FP32, but compute uses TF32
-        cublasSetMathMode(handle.second, CUBLAS_TF32_TENSOR_OP_MATH);
-        float alpha_f = static_cast<float>(alpha);
-        float beta_f = static_cast<float>(beta);
-        CUBLAS_CHECK(cublasGemmEx(handle.second, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
-                                  &alpha_f,
-                                  B, CUDA_R_64F, ldb,
-                                  A, CUDA_R_64F, lda,
-                                  &beta_f,
-                                  C, CUDA_R_64F, ldc,
-                                  CUBLAS_COMPUTE_32F_FAST_TF32,
-                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        cublasSetMathMode(handle.second, CUBLAS_DEFAULT_MATH);
-        break;
-      }
-      case GemmDType::FP32: {
-        // FP32: Use cublasGemmEx with FP32 compute
-        float alpha_f = static_cast<float>(alpha);
-        float beta_f = static_cast<float>(beta);
-        CUBLAS_CHECK(cublasGemmEx(handle.second, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
-                                  &alpha_f,
-                                  B, CUDA_R_64F, ldb,
-                                  A, CUDA_R_64F, lda,
-                                  &beta_f,
-                                  C, CUDA_R_64F, ldc,
-                                  CUBLAS_COMPUTE_32F,
-                                  CUBLAS_GEMM_DEFAULT));
-        break;
-      }
-      case GemmDType::FP16: {
-        // FP16: Use cublasGemmEx with FP16 compute (data stays FP64, compute in FP16)
-        float alpha_f = static_cast<float>(alpha);
-        float beta_f = static_cast<float>(beta);
-        CUBLAS_CHECK(cublasGemmEx(handle.second, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
-                                  &alpha_f,
-                                  B, CUDA_R_64F, ldb,
-                                  A, CUDA_R_64F, lda,
-                                  &beta_f,
-                                  C, CUDA_R_64F, ldc,
-                                  CUBLAS_COMPUTE_16F,
-                                  CUBLAS_GEMM_DEFAULT));
-        break;
-      }
-      case GemmDType::BF16: {
-        // BF16: Use cublasGemmEx with BF16 compute (requires Ampere+)
-        float alpha_f = static_cast<float>(alpha);
-        float beta_f = static_cast<float>(beta);
-        cublasSetMathMode(handle.second, CUBLAS_TF32_TENSOR_OP_MATH);
-        CUBLAS_CHECK(cublasGemmEx(handle.second, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
-                                  &alpha_f,
-                                  B, CUDA_R_64F, ldb,
-                                  A, CUDA_R_64F, lda,
-                                  &beta_f,
-                                  C, CUDA_R_64F, ldc,
-                                  CUBLAS_COMPUTE_32F,
-                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        cublasSetMathMode(handle.second, CUBLAS_DEFAULT_MATH);
-        break;
-      }
-      case GemmDType::FP64:
-      default: {
-        // FP64: Default double precision GEMM
-        CUBLAS_CHECK(cublasDgemm(handle.second, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, B, ldb, A,
-                                 lda, &beta, C, ldc));
-        break;
-      }
-    }
+    CUBLAS_CHECK(cublasDgemm(handle.second, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, B, ldb, A,
+                             lda, &beta, C, ldc));
   }
 
   // Synchronize and record timing if profiling enabled
